@@ -1,0 +1,11 @@
+id,calibration_trial_id_fs,calibration_trial_id_bs,update_timestamp,principalp_h_fs,principalp_v_fs,principalp_h_bs,principalp_v_bs,sid_fs,sid_bs,obsolete,method,git_hash,git_repo,operator
+1,151,159,"2023-04-14 14:42:48",-10.1351,2.02703,2.72109,-6.12245,1851.35,1860.54,0,whatever,ac9b0b229b323ba6a1c57d494b0d1a1193285411,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+2,7,15,"2023-04-14 14:42:48",-10.1351,0.675676,2.04082,-6.80272,1851.35,1860.54,0,whatever,ac9b0b229b323ba6a1c57d494b0d1a1193285411,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+3,119,127,"2023-04-14 14:42:48",-10.8108,1.35135,2.72109,-6.12245,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+4,23,31,"2023-04-14 14:42:48",-11.4865,1.35135,2.04082,-8.84354,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+5,87,95,"2023-04-14 14:42:48",-11.4865,0.675676,8.16327,-7.48299,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+6,135,143,"2023-04-14 14:42:48",-10.2041,1.36054,2.72109,-5.44218,1860.54,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+7,39,47,"2023-04-14 14:42:48",-10.8108,1.35135,4.08163,-5.44218,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+8,103,111,"2023-04-14 14:42:48",-10.1351,2.02703,7.48299,-6.80272,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+9,55,63,"2023-04-14 14:42:48",-11.4865,2.02703,4.08163,-4.7619,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch
+10,71,79,"2023-04-14 14:42:48",-11.4865,1.35135,3.40136,-6.12245,1851.35,1860.54,0,whatever,3b3bbd00ae5162ef8d59d11807a0dc61384cdbbd,https://gitlab.ethz.ch/lmb/dupla_sical,root@hest2-vpn-1-a-028.ethz.ch

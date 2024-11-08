@@ -1,0 +1,37 @@
+Just some thoughts on SQL queries for the DUPLA database
+
+
+# Calibration
+Let's say we have a measurement "meas_id" that we want to find the calibrations for
+
+SELECT sic.* 
+FROM source_int_calibration as sic
+INNER JOIN 
+calibration_trials as ct
+ON sic.calibration_trial_id = ct.id
+INNER JOIN
+measurements as m
+ON m.trials_id = ct.trials_id
+WHERE m.id = meas_id
+
+# Pose
+We are looking at a specific measurement and have one anatomy (which is saved)
+SELECT poses.*
+FROM poses
+INNER JOIN 
+measurements as m
+ON poses.measurement_id = m.id
+WHERE poses.measurement_id = meas_id 
+AND poses.anatomy_id = anat_id
+ORDER BY datetime DESC
+
+# get anatomy path by its id
+SELECT trials.data_path, anatomies.path
+FROM anatomies
+INNER JOIN
+subjects ON anatomies.id = subjects.id
+INNER JOIN
+trials ON subjects.trials_id = trials.id
+INNER JOIN
+studies ON trials.study_id = studies.id
+WHERE anatomies.id = %(anatomies_id)i

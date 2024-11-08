@@ -1,0 +1,6 @@
+matplotlib==3.4.2
+mysql-connector-python
+numpy==1.21.0
+Pillow==9.3.0
+pytest==6.2.4
+scikit_image==0.18.2
