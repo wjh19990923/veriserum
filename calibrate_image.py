@@ -18,8 +18,8 @@ def calibrate_and_save(idx):
         dataset = Veriserum_calibrated(calibration_on_time=True)
 
         # 设置校准后图像的输出路径
-        bs_save_path = os.path.join(output_folder, f'calibrated_bs_{idx:06d}.png')
-        fs_save_path = os.path.join(output_folder, f'calibrated_fs_{idx:06d}.png')
+        bs_save_path = os.path.join(output_folder, f'calibrated_bs_{idx:06d}.jpg')
+        fs_save_path = os.path.join(output_folder, f'calibrated_fs_{idx:06d}.jpg')
 
         # 检查校准后图像是否已经存在
         if os.path.exists(bs_save_path) and os.path.exists(fs_save_path):
@@ -58,8 +58,8 @@ def calibrate_and_save(idx):
 # 主程序
 if __name__ == '__main__':
     start_time = time.time()
-    num_workers = max(1, os.cpu_count() - 2)  # 减少进程数
-    total_images = 1000  # 设置需要处理的图像数量
+    num_workers = max(1, os.cpu_count() // 2)  # 减少进程数
+    total_images = 110990  # 设置需要处理的图像数量
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(calibrate_and_save, idx) for idx in range(1, total_images + 1)]

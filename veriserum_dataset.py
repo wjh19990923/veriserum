@@ -18,7 +18,7 @@ DTYPE_TORCH = torch.float32
 
 
 class Veriserum_calibrated(Dataset):
-    def __init__(self, transform=None, anatomy='femur', calibration_on_time=False):
+    def __init__(self, transform=None, anatomy='femur', calibration_on_time=False,data_length=None):
         self.original_image_folder = r'D:\veriserum_collection_compressed'
         self.calibrated_image_folder = rf'D:\veriserum_calibrated'
 
@@ -29,9 +29,17 @@ class Veriserum_calibrated(Dataset):
         self.transform = transform
         self.calibration_on_time = calibration_on_time
         self.anatomy = anatomy
+        self.data_length=data_length
 
         self.veriserum_discal = pd.read_csv(r'csv_files/distortion_calibration_reloaded.csv')
         self.veriserum_sical = pd.read_csv(r'csv_files/source_int_calibration_reloaded.csv')
+
+    def __len__(self):
+        if self.data_length is None:
+            total_length = len(self.veriserum_poses)
+        else:
+            total_length=self.data_length
+        return total_length
 
     def __getitem__(self, idx):
         img_name = self.get_img_name(idx)
@@ -52,8 +60,8 @@ class Veriserum_calibrated(Dataset):
             target_img_bs, target_img_fs = self.get_calibrated_images(idx, target_img_bs, target_img_fs)
 
         # 将图像堆叠为 3 通道并应用变换
-        combined_image = np.stack([target_img_bs, target_img_fs, np.zeros_like(target_img_bs)], axis=2)
-        combined_image = Image.fromarray((combined_image * 255).astype(np.uint8))
+        combined_image = torch.tensor(np.stack([target_img_bs, target_img_fs, np.zeros_like(target_img_bs)], axis=2))
+        # combined_image = Image.fromarray((combined_image * 255).astype(np.uint8))
         if self.transform:
             combined_image = self.transform(combined_image)
 
@@ -91,7 +99,7 @@ class Veriserum_calibrated(Dataset):
         if self.calibration_on_time:
             return f'bs_{id_str}.jpg', f'fs_{id_str}.jpg'
         else:
-            return f'calibrated_bs_{id_str}.png', f'calibrated_fs_{id_str}.png'
+            return f'calibrated_bs_{id_str}.jpg', f'calibrated_fs_{id_str}.jpg'
 
     def get_measurement_id(self, idx):
         df = self.veriserum_poses
