@@ -4,7 +4,7 @@ from torch.utils.data import Sampler
 
 
 class NonObsoleteSampler(Sampler):
-    def __init__(self, dataset, length=1000):
+    def __init__(self, dataset, length=1000,anatomy_id=1):
         """
         Initialize the sampler with a dataset. This sampler filters the dataset
         to only include indices where `id` is not 0 and `obsolete` is 0.
@@ -16,7 +16,7 @@ class NonObsoleteSampler(Sampler):
         # 获取所有符合条件的有效索引：id 不为 0，且 obsolete 为 0
         self.valid_indices = [
             i for i in range(1, length+1)
-            if dataset.get_obsolete(i) == 0
+            if dataset.get_obsolete(i) == 0 and dataset.get_anatomy_id(i)==anatomy_id
         ]
 
     def __iter__(self):

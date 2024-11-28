@@ -3,3 +3,6 @@ __pycache__
 .pytest_cache
 lightning_logs
 calibrated_images
+*.ckpt
+checkpoints_*
+pretrain_logs

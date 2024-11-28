@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from scipy.spatial.transform import Rotation as R
 from torch.utils.tensorboard import SummaryWriter
 from dupla_packages.dupla_tools.dupla_classes import DistortionCalibration
+from pytorch3d.transforms import rotation_6d_to_matrix,euler_angles_to_matrix,matrix_to_rotation_6d
 
 import cv2
 import pandas as pd
@@ -18,7 +19,7 @@ DTYPE_TORCH = torch.float32
 
 
 class Veriserum_calibrated(Dataset):
-    def __init__(self, transform=None, anatomy='femur', calibration_on_time=False,data_length=None):
+    def __init__(self, transform=None, anatomy='femur', calibration_on_time=False, data_length=None, anatomy_id=1):
         self.original_image_folder = r'D:\veriserum_collection_compressed'
         self.calibrated_image_folder = rf'D:\veriserum_calibrated'
 
@@ -29,27 +30,37 @@ class Veriserum_calibrated(Dataset):
         self.transform = transform
         self.calibration_on_time = calibration_on_time
         self.anatomy = anatomy
-        self.data_length=data_length
-
+        self.data_length = data_length
+        self.anatomy_id = anatomy_id
         self.veriserum_discal = pd.read_csv(r'csv_files/distortion_calibration_reloaded.csv')
         self.veriserum_sical = pd.read_csv(r'csv_files/source_int_calibration_reloaded.csv')
+
+        # self._filter_dataframe()
 
     def __len__(self):
         if self.data_length is None:
             total_length = len(self.veriserum_poses)
         else:
-            total_length=self.data_length
+            total_length = self.data_length
         return total_length
+
+    def _filter_dataframe(self):
+        """using anatomy_type to filter the data"""
+        self.veriserum_poses = self.veriserum_poses[
+            (self.veriserum_poses['anatomy_id'] == self.anatomy_id)
+        ]
+        print(rf'df has {len(self.veriserum_poses)} rows that matches the anatomy')
 
     def __getitem__(self, idx):
         img_name = self.get_img_name(idx)
         img_path_bs = os.path.join(self.image_folder, img_name[0])
         img_path_fs = os.path.join(self.image_folder, img_name[1])
 
-        # 加载图像
+        # 加载图像并归一化
         target_img_bs = np.asarray(Image.open(img_path_bs)).astype("float32") / 255.0
         target_img_fs = np.asarray(Image.open(img_path_fs)).astype("float32") / 255.0
 
+        # 检查最大值并归一化
         if target_img_bs.max() == 0 or target_img_fs.max() == 0:
             print(f"Image max value is 0 for {img_name}")
         else:
@@ -59,12 +70,22 @@ class Veriserum_calibrated(Dataset):
         if self.calibration_on_time:
             target_img_bs, target_img_fs = self.get_calibrated_images(idx, target_img_bs, target_img_fs)
 
-        # 将图像堆叠为 3 通道并应用变换
-        combined_image = torch.tensor(np.stack([target_img_bs, target_img_fs, np.zeros_like(target_img_bs)], axis=2))
-        # combined_image = Image.fromarray((combined_image * 255).astype(np.uint8))
-        if self.transform:
-            combined_image = self.transform(combined_image)
+        # 将图像堆叠为 3 通道
+        combined_image = np.stack([target_img_bs, target_img_fs, np.zeros_like(target_img_bs)], axis=2)
 
+        # 转换为 PIL.Image 格式
+        combined_image = Image.fromarray((combined_image * 255).astype(np.uint8))
+
+        # 应用变换
+        if self.transform:
+            combined_image = self.transform(combined_image)  # 调用 transform
+
+        # 确保最终输出为 torch.Tensor
+        combined_image = torch.tensor(np.array(combined_image)) if not isinstance(combined_image,
+                                                                                  torch.Tensor) else combined_image
+        assert combined_image.max() <= 1
+        assert combined_image.min() >= 0
+        # 获取姿态
         pose = self.get_pose_veriserum(idx)
         return {'image': combined_image, 'pose': pose}
 
@@ -185,17 +206,13 @@ class Veriserum_calibrated(Dataset):
                 df[df['id'] == idx][f'rx'].values[0],
                 df[df['id'] == idx][f'ry'].values[0],
             ], dtype=float)
-            # breakpoint()
-            # calibration_settings = np.array([
-            #     df[df['id'] == id][f'cal_focal_length'].values[0],
-            #     df[df['id'] == id][f'cal_mm_per_pxl'].values[0],
-            #     df[df['id'] == id][f'cal_principalp_x'].values[0],
-            #     df[df['id'] == id][f'cal_principalp_y'].values[0],
-            # ], dtype=np.float32)
-            # Convert Euler angles to rotation matrix using ZXY convention
-            # rotation_matrix = R.from_euler('ZXY', euler_angles, degrees=True).as_matrix()
+            # 将欧拉角转换为 6D 旋转表示
+            rotation_matrix = R.from_euler('ZXY', pose_veriserum[3:], degrees=True).as_matrix()
+            rotation_6d = matrix_to_rotation_6d(torch.tensor(rotation_matrix)) # 6D
 
-            return torch.tensor(pose_veriserum.astype(np.float32), dtype=DTYPE_TORCH)
+            # 拼接平移和 6D 旋转
+            pose_9d = np.concatenate([pose_veriserum[:3], rotation_6d]).astype(np.float32)
+            return torch.tensor(pose_9d, dtype=DTYPE_TORCH)
         else:
             # if not exists, raise an error
             raise ValueError(f"ID {idx} does not exist in the data.")
