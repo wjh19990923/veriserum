@@ -229,7 +229,7 @@ def ncc(x, y, return_map=False, reduction='mean', eps=1e-8):
     # print(f"NCC requires_grad: {ncc.requires_grad}, grad_fn: {ncc.grad_fn}")
     # 根据 reduction 参数进行归约
     if reduction == 'mean':
-        ncc = torch.mean(torch.sum(ncc, dim=1))
+        ncc = 1 - torch.mean(torch.sum(ncc, dim=1))
     elif reduction == 'sum':
         ncc = torch.sum(ncc)
     else:

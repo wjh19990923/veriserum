@@ -4,7 +4,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, random_split
-from model import PoseEstimationModelWithPretrainedAutoencoder, EncoderDecoderSelfSupervised  # 导入模型
+from model import PoseEstimationFineTuneModel, EncoderDecoderSelfSupervised  # 导入模型
 from veriserum_dataset import Veriserum_calibrated  # 假设数据集在 veriserum_dataset.py 文件中
 from sampler import NonObsoleteSampler  # 假设采样器在 sampler.py 文件中
 import torchvision.transforms as transforms
@@ -61,9 +61,9 @@ def main(loss_type='combine'):
     # pretrain_model = EncoderDecoderSelfSupervised(learning_rate=1e-3, loss_type=loss_type)
 
     # 初始化新模型
-    pretrained_path = rf'C:\Users\Public\Public Dupla\veriserum\checkpoints_pretrained\pretrain_combine_epoch=134-val_loss=0.4294.ckpt'
+    pretrained_path = rf'C:\Users\Public\Public Dupla\veriserum\checkpoints_pretrained\pretrain_gcc_epoch=199-val_loss=0.3543.ckpt'
 
-    model = PoseEstimationModelWithPretrainedAutoencoder(autoencoder_checkpoint=pretrained_path, learning_rate=1e-3, loss_type='mse',
+    model = PoseEstimationFineTuneModel(autoencoder_checkpoint=pretrained_path, learning_rate=1e-3, loss_type='mse',
                                            anatomy_path=rf'D:\veriserum_anatomies\ana_000001_HU10000_filled.nii')
     # 加载预训练的 Encoder 和 Decoder 权重
 

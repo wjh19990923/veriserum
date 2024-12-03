@@ -3,8 +3,9 @@ import torch.nn as nn
 import torchvision.models as models
 import pytorch_lightning as pl
 from torchvision.utils import make_grid
+from torchvision.models import resnext50_32x4d
 
-from losses import GeodesicLossOrtho6d, gcc_loss
+from losses import GeodesicLossOrtho6d, gcc_loss, ncc
 from pytorch_msssim import SSIM
 from dupla_renderers.pytorch3d import AnatomyCT, Camera, CTRenderer, STLRenderer, Scene
 from pytorch3d.transforms import rotation_6d_to_matrix, euler_angles_to_matrix, matrix_to_rotation_6d
@@ -12,71 +13,11 @@ from pytorch3d.transforms import rotation_6d_to_matrix, euler_angles_to_matrix, 
 DTYPE_TORCH = torch.float32
 
 
-class MHSAB(nn.Module):
-    def __init__(self, dim, num_heads=8, mlp_ratio=4., dropout=0.1):
-        """
-        Multi-Head Self-Attention Block (MHSAB)
-        Args:
-            dim (int): 输入特征维度。
-            num_heads (int): 注意力头的数量。
-            mlp_ratio (float): FFN 的扩展比。
-            dropout (float): Dropout 概率。
-        """
-        super(MHSAB, self).__init__()
-        self.num_heads = num_heads
-        self.attention = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.ReLU(),
-            nn.Linear(int(dim * mlp_ratio), dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        # Self-Attention
-        attn_output, _ = self.attention(x, x, x)
-        x = x + attn_output  # 残差连接
-        x = self.norm1(x)
-
-        # Feed-Forward Network
-        mlp_output = self.mlp(x)
-        x = x + mlp_output  # 残差连接
-        x = self.norm2(x)
-        return x
-
-
-class Learnable2DPositionEmbedding(nn.Module):
-    def __init__(self, height, width, dim):
-        """
-        2D Learnable Position Embedding
-        Args:
-            height (int): 特征图的高度。
-            width (int): 特征图的宽度。
-            dim (int): 特征维度。
-        """
-        super(Learnable2DPositionEmbedding, self).__init__()
-        self.position_embedding = nn.Parameter(torch.randn(1, dim, height, width))  # [1, dim, H, W]
-
-    def forward(self, x):
-        """
-        将位置嵌入加到输入特征上。
-        Args:
-            x (torch.Tensor): 输入特征 [B, dim, H, W]
-        Returns:
-            torch.Tensor: 加上位置嵌入的特征 [B, dim, H, W]
-        """
-        return x + self.position_embedding
-
-
-class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
-    def __init__(self, autoencoder_checkpoint, anatomy_path=None, learning_rate=1e-3, num_heads=4, loss_type='combine',
-                 freeze_pretrained=False, renderer_type='CT'):
-        super(PoseEstimationModelWithPretrainedAutoencoder, self).__init__()
+class PoseEstimationFineTuneModel(pl.LightningModule):
+    def __init__(self, anatomy_path,autoencoder_checkpoint, learning_rate=1e-3, freeze_pretrained=True, loss_type='gcc'):
+        super(PoseEstimationFineTuneModel, self).__init__()
         self.learning_rate = learning_rate
         self.loss_type = loss_type
-        self.renderer_type = renderer_type
 
         # 加载预训练的 AutoEncoder 模型
         self.autoencoder = EncoderDecoderSelfSupervised()
@@ -88,35 +29,14 @@ class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
             for param in self.autoencoder.parameters():
                 param.requires_grad = False
 
-        # 从 AutoEncoder 提取的隐藏层特征
-        self.feature_extractor = self.autoencoder.deeplab.backbone  # 提取 DeepLab backbone
-        self.feature_to_map = nn.Sequential(
-            nn.Conv2d(2048, 256, kernel_size=1),  # backbone 输出为 2048 维，映射到 256
-            nn.ReLU(),
-        )
-
-        # MHSAB 模块
-        self.mhsab = MHSAB(dim=256, num_heads=num_heads)
-
-        # 2D Learnable Position Embedding
-        self.position_embedding = Learnable2DPositionEmbedding(height=32, width=32, dim=256)
-
-        # 解码器：从 autoencoder 解码部分复用
-        self.decoder = self.autoencoder.deeplab.classifier
-
-        # 姿态回归器
-        self.regressor = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256 * 32 * 32, 512),  # 输入展平的特征
-            nn.ReLU(),
-            nn.Linear(512, 9)  # 输出 9D 姿态参数
-        )
+        # 姿态估计网络：ResNeXt50
+        self.resnext = resnext50_32x4d(weights="DEFAULT")
+        self.resnext.fc = nn.Linear(self.resnext.fc.in_features, 9)  # 输出为 9D 姿态参数
 
         # 损失函数
         self.translation_loss = nn.SmoothL1Loss()
         self.rotation_loss = GeodesicLossOrtho6d()
         self.mse_loss = nn.MSELoss()
-
         # 可选：绑定解剖学和渲染器
         if anatomy_path is not None:
             self.anatomy_ct = AnatomyCT.load_data(anatomy_path)
@@ -124,6 +44,17 @@ class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
             self.renderer = renderer
             self.cam = cam
             self.their_world_to_yours = their_world_to_yours.to(self.device)
+    def forward(self, x):
+        """
+        前向传播：
+        1. 使用预训练的 AutoEncoder 解码输入图像。
+        2. 将解码后的图像作为输入传递到 ResNeXt。
+        """
+        with torch.no_grad():  # 确保 autoencoder 不更新
+            decoded_image = self.autoencoder(x)  # 解码图像 [B, C, H, W]
+
+        pose = self.resnext(decoded_image)  # 姿态预测 [B, 9]
+        return pose, decoded_image
 
     def _initialize_renderer_and_scene(self):
         cal_pixel_size = 0.225
@@ -157,41 +88,10 @@ class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
         scene_sipla.add_anatomies(self.anatomy_ct)
         scene_sipla.add_cameras(cam)
 
-        if self.renderer_type == 'CT':
-            renderer = CTRenderer(device="cuda")
-        else:
-            renderer = STLRenderer(device="cuda")
+        renderer = CTRenderer(device="cuda")
         renderer.bind_scene(scene_sipla)
 
         return renderer, cam, their_world_to_yours
-
-    def forward(self, x):
-        """
-        前向传播：
-        1. 提取 backbone 特征。
-        2. MHSAB 增强特征。
-        3. 解码重建图像。
-        4. 姿态参数预测。
-        """
-        # 提取特征
-        features = self.feature_extractor(x)['out']  # backbone 输出
-        # breakpoint()
-        feature_map = self.feature_to_map(features)  # 转换为卷积特征图
-
-        # 添加 Learnable 位置嵌入
-        feature_map_with_pos = self.position_embedding(feature_map)
-
-        # MHSAB 增强
-        feature_map_flat = feature_map_with_pos.flatten(2).permute(2, 0, 1)  # [seq_len, batch_size, dim]
-        enhanced_features = self.mhsab(feature_map_flat).permute(1, 2, 0).view(-1, 256, 32, 32)  # [B, 256, 4, 4]
-
-        # 解码生成图像
-        # decoded_image = self.decoder(enhanced_features)
-
-        # 回归姿态参数
-        pose = self.regressor(enhanced_features.flatten(1))  # [B, 9]
-
-        return pose
 
     def compute_loss(self, images, decoded_image):
         """
@@ -255,7 +155,7 @@ class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, target_pose = batch['image'], batch['pose']
-        pred_pose = self(images)
+        pred_pose, decoded_image = self(images)
 
         # 分割 9D 表示为平移和旋转
         pred_translation, pred_rotation = pred_pose[:, :3], pred_pose[:, 3:]
@@ -264,52 +164,15 @@ class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
         # 计算损失
         loss_translation = self.translation_loss(pred_translation, target_translation)
         loss_rotation = self.rotation_loss(pred_rotation, target_rotation)
-        # loss_structural = self.compute_loss(decoded_image, images)  # Structural-Aware Loss
+        loss_structural = self.compute_loss(images, decoded_image)  # Structural-Aware Loss
 
-        # gcc_loss_value = 0
-        # # add NCC loss
-        # for i in range(len(pred_pose)):
-        #     pred_tmat = self.pose_to_tmat(pred_pose[i])
-        #
-        #     # 生成虚拟X-ray图像
-        #     rendered_image = self.generate_virtual_xray_with_grad(
-        #         tmat=pred_tmat,
-        #         img_resolution_width=images[i].shape[-1],
-        #         img_resolution_height=images[i].shape[-1], binary=False)
-        #
-        #     # 将原始图像与生成图像进行NCC计算
-        #     background_image_tensor = images[i].clone().detach().unsqueeze(dim=0).to(dtype=torch.float32)
-        #
-        #     gcc_loss_value += gcc_loss(rendered_image, background_image_tensor[:, 0, :, :])
-        #
-        #     # 对所有样本的NCC损失求平均
-        # gcc_loss_value = gcc_loss_value / len(pred_pose)
-
-        loss = loss_translation + loss_rotation
-        # 记录损失
-        self.log('train_loss', loss)
-        self.log('train_translation_loss', loss_translation)
-        self.log('train_rotation_loss', loss_rotation)
-        # self.log('train_structural_loss', loss_structural)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        images, target_pose = batch['image'], batch['pose']
-        pred_pose = self(images)
-
-        pred_translation, pred_rotation = pred_pose[:, :3], pred_pose[:, 3:]
-        target_translation, target_rotation = target_pose[:, :3], target_pose[:, 3:]
-
-        loss_translation = self.translation_loss(pred_translation, target_translation)
-        loss_rotation = self.rotation_loss(pred_rotation, target_rotation)
-        # loss_structural = self.compute_loss(decoded_image, images)  # Structural-Aware Loss
-        # gcc_loss_value = 0
-        pred_synth = []
+        gcc_loss_value = 0
+        # add NCC loss
         for i in range(len(pred_pose)):
             pred_tmat = self.pose_to_tmat(pred_pose[i])
 
             # 生成虚拟X-ray图像
-            rendered_image = self.generate_virtual_xray_with_grad(
+            rendered_image = 1 - self.generate_virtual_xray_with_grad(
                 tmat=pred_tmat,
                 img_resolution_width=images[i].shape[-1],
                 img_resolution_height=images[i].shape[-1], binary=False)
@@ -317,30 +180,72 @@ class PoseEstimationModelWithPretrainedAutoencoder(pl.LightningModule):
             # 将原始图像与生成图像进行NCC计算
             background_image_tensor = images[i].clone().detach().unsqueeze(dim=0).to(dtype=torch.float32)
 
-            # gcc_loss_value += gcc_loss(rendered_image, background_image_tensor[:, 0, :, :])
+            gcc_loss_value += gcc_loss(rendered_image, background_image_tensor[:, 0, :, :])
+
+            # 对所有样本的NCC损失求平均
+        gcc_loss_value = gcc_loss_value / len(pred_pose)
+
+        loss = loss_translation + loss_rotation + gcc_loss_value
+        # 记录损失
+        self.log('train_loss', loss)
+        self.log('train_translation_loss', loss_translation)
+        self.log('train_rotation_loss', loss_rotation)
+        self.log('train_structural_loss', loss_structural)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, target_pose = batch['image'], batch['pose']
+        pred_pose, decoded_image = self(images)
+
+        pred_translation, pred_rotation = pred_pose[:, :3], pred_pose[:, 3:]
+        target_translation, target_rotation = target_pose[:, :3], target_pose[:, 3:]
+
+        loss_translation = self.translation_loss(pred_translation, target_translation)
+        loss_rotation = self.rotation_loss(pred_rotation, target_rotation)
+        loss_structural = self.compute_loss(images, decoded_image)  # Structural-Aware Loss
+        gcc_loss_value = 0
+        pred_synth = []
+        for i in range(len(pred_pose)):
+            pred_tmat = self.pose_to_tmat(pred_pose[i])
+
+            # 生成虚拟X-ray图像
+            rendered_image = 1 - self.generate_virtual_xray_with_grad(
+                tmat=pred_tmat,
+                img_resolution_width=images[i].shape[-1],
+                img_resolution_height=images[i].shape[-1], binary=False)
+
+            # 将原始图像与生成图像进行NCC计算
+            background_image_tensor = images[i].clone().detach().unsqueeze(dim=0).to(dtype=torch.float32)
+
+            gcc_loss_value += gcc_loss(rendered_image, background_image_tensor[:, 0, :, :])
             pred_synth.append(torch.tensor(rendered_image).unsqueeze(0))  # (1, 1, H, W)
             # 对所有样本的NCC损失求平均
         pred_synth = torch.cat(pred_synth, dim=0)  # (B, 1, H, W)
-        # gcc_loss_value = gcc_loss_value / len(pred_pose)
+        gcc_loss_value = gcc_loss_value / len(pred_pose)
 
-        val_loss = loss_translation + loss_rotation
+        val_loss = loss_translation + loss_rotation + gcc_loss_value
 
         self.log('val_loss', val_loss, prog_bar=True)
         self.log('val_translation_loss', loss_translation, prog_bar=True)
         self.log('val_rotation_loss', loss_rotation, prog_bar=True)
-        # self.log('val_structural_loss', loss_structural, prog_bar=True)
+        self.log('val_structural_loss', loss_structural, prog_bar=True)
         # Log images (log only the first batch)
         if batch_idx == 0:
             # Make grids
             batch_size = images.shape[0]
             indices = torch.randperm(batch_size)[:4] if batch_size > 8 else torch.arange(batch_size)
             input_images = images[indices, 0:1, :, :]
+            decoded_images = decoded_image[indices, 0:1, :, :]
             # breakpoint()
             input_images_grid = make_grid(input_images, nrow=2, normalize=True, value_range=(0, 1))
+            decoded_images_grid = make_grid(decoded_images, nrow=2, normalize=True, value_range=(0, 1))
+
             pred_images_grid = make_grid(pred_synth, nrow=2, normalize=True, value_range=(0, 1))
 
             # Add images to TensorBoard
             self.logger.experiment.add_image('val_input_images', input_images_grid, self.current_epoch,
+                                             dataformats="CHW")
+            self.logger.experiment.add_image('val_decoded_images', decoded_images_grid, self.current_epoch,
                                              dataformats="CHW")
             self.logger.experiment.add_image('val_pred_images', pred_images_grid, self.current_epoch, dataformats="CHW")
 
