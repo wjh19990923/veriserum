@@ -1,11 +1,13 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.models as models
 import pytorch_lightning as pl
+from scipy.spatial.transform import Rotation
 from torchvision.utils import make_grid
 from torchvision.models import resnext50_32x4d
 
-from losses import GeodesicLossOrtho6d, gcc_loss, ncc
+from losses import GeodesicLossOrtho6d, gcc_loss, ncc_loss
 from pytorch_msssim import SSIM
 from dupla_renderers.pytorch3d import AnatomyCT, Camera, CTRenderer, STLRenderer, Scene
 from pytorch3d.transforms import rotation_6d_to_matrix, euler_angles_to_matrix, matrix_to_rotation_6d
@@ -13,21 +15,36 @@ from pytorch3d.transforms import rotation_6d_to_matrix, euler_angles_to_matrix, 
 DTYPE_TORCH = torch.float32
 
 
+class InterIntensifierCalibration:
+    def __init__(self):
+        pass
+
+    def load_default_values(self):
+        self.bs_pos = np.array((0.0, 0, 0))
+        self.bs_normal_vec = np.array((0.0, 0, 1))
+        self.bs_vertical_vec = np.array((0.0, 1, 0))
+        self.fs_normal_vec = np.dot(
+            Rotation.from_rotvec(np.deg2rad(70) * np.array([0, -1, 0])).as_matrix(),
+            self.bs_normal_vec,
+        )
+        self.fs_pos = np.array((360.0, 0, 250))  # veriserum inter-plane setting
+        self.fs_vertical_vec = np.array((0.0, 1, 0))
+
+    def load_from_dict(self, d):
+        self.bs_pos = d["bs_pos"]
+        self.bs_normal_vec = d["bs_normal_vec"]
+        self.bs_vertical_vec = d["bs_vertical_vec"]
+        self.fs_pos = d["fs_pos"]
+        self.fs_vertical_vec = d["fs_vertical_vec"]
+        self.fs_normal_vec = d["fs_normal_vec"]
+
+
 class PoseEstimationFineTuneModel(pl.LightningModule):
-    def __init__(self, anatomy_path,autoencoder_checkpoint, learning_rate=1e-3, freeze_pretrained=True, loss_type='gcc'):
+    def __init__(self, anatomy_path, learning_rate=1e-3, freeze_pretrained=True, loss_type='gcc', translation_range=10,
+                 rotation_range=10, freeze=None):
         super(PoseEstimationFineTuneModel, self).__init__()
         self.learning_rate = learning_rate
         self.loss_type = loss_type
-
-        # 加载预训练的 AutoEncoder 模型
-        self.autoencoder = EncoderDecoderSelfSupervised()
-        checkpoint = torch.load(autoencoder_checkpoint)
-        self.autoencoder.load_state_dict(checkpoint['state_dict'])
-
-        # 冻结 AutoEncoder 权重（可选）
-        if freeze_pretrained:
-            for param in self.autoencoder.parameters():
-                param.requires_grad = False
 
         # 姿态估计网络：ResNeXt50
         self.resnext = resnext50_32x4d(weights="DEFAULT")
@@ -36,49 +53,106 @@ class PoseEstimationFineTuneModel(pl.LightningModule):
         # 损失函数
         self.translation_loss = nn.SmoothL1Loss()
         self.rotation_loss = GeodesicLossOrtho6d()
+
+        self.translation_range = translation_range  # 平移噪声范围 (单位: mm)
+        self.rotation_range = rotation_range  # 旋转噪声范围 (单位: 度)
+        self.use_render_p = 1.0
+        self.use_render_loss = True
+
         self.mse_loss = nn.MSELoss()
         # 可选：绑定解剖学和渲染器
         if anatomy_path is not None:
             self.anatomy_ct = AnatomyCT.load_data(anatomy_path)
-            renderer, cam, their_world_to_yours = self._initialize_renderer_and_scene()
+            renderer, their_world_to_yours = self._initialize_renderer_and_scene()
             self.renderer = renderer
-            self.cam = cam
             self.their_world_to_yours = their_world_to_yours.to(self.device)
+        if freeze is not None:
+            self._freeze_partial_model(self.resnext, freeze_ratio=freeze)
+            print(f'freeze layers ratio:{freeze}')
+
+    def _freeze_partial_model(self, model, freeze_ratio):
+        """freeze part of the model"""
+        total_layers = len(list(model.parameters()))
+        freeze_layers = int(total_layers * freeze_ratio)
+
+        for i, param in enumerate(model.parameters()):
+            if i < freeze_layers:
+                param.requires_grad = False
+            else:
+                break
+
     def forward(self, x):
         """
         前向传播：
         1. 使用预训练的 AutoEncoder 解码输入图像。
         2. 将解码后的图像作为输入传递到 ResNeXt。
         """
-        with torch.no_grad():  # 确保 autoencoder 不更新
-            decoded_image = self.autoencoder(x)  # 解码图像 [B, C, H, W]
 
-        pose = self.resnext(decoded_image)  # 姿态预测 [B, 9]
-        return pose, decoded_image
+        pose = self.resnext(x)  # 姿态预测 [B, 9]
+        return pose
+
+    def add_noise_to_tmat(self, tmat):
+        """
+        对变换矩阵 (4x4) 添加噪声，包括随机平移和随机旋转。
+        """
+        # 添加平移噪声
+        translation_noise = np.random.uniform(-self.translation_range, self.translation_range, 3)
+        translation_noise = torch.tensor(translation_noise, dtype=torch.float32, device=tmat.device)
+        # breakpoint()
+        tmat[:, :3, 3] += translation_noise
+
+        # 添加旋转噪声
+        rotation_angle = np.random.uniform(0, np.deg2rad(self.rotation_range))
+        rotation_axis = np.random.uniform(-1, 1, 3)
+        rotation_axis /= np.linalg.norm(rotation_axis)  # 归一化轴
+        rotation_matrix = Rotation.from_rotvec(rotation_angle * rotation_axis).as_matrix()
+
+        rotation_matrix = torch.tensor(rotation_matrix, dtype=torch.float32, device=tmat.device)
+        tmat[:, :3, :3] = torch.matmul(rotation_matrix, tmat[:, :3, :3])
+
+        return tmat
 
     def _initialize_renderer_and_scene(self):
-        cal_pixel_size = 0.225
-        cal_principal_point_h = 2.72
-        cal_principal_point_v = -6.12
-        cal_focal_length = 1860.54
+        Intensifiers = InterIntensifierCalibration()
+        Intensifiers.load_default_values()
 
-        cam = Camera(
+        cal_pixel_size = 0.225
+        cal_principal_point_h_bs = 2.72
+        cal_principal_point_v_bs = -6.12
+        cal_focal_length_bs = 1860.54
+
+        cal_principal_point_h_fs = -10.1351
+        cal_principal_point_v_fs = 2.02703
+        cal_focal_length_fs = 1851.35
+
+        camera_1 = Camera(
             "camera_1",
-            (0, 0, 0),
-            (0, 0, 1),
-            (0, 1, 0),
-            1600 * cal_pixel_size,
-            1600 * cal_pixel_size,
-            cal_principal_point_h,
-            cal_principal_point_v,
-            cal_focal_length,
+            screen_center_poses=Intensifiers.bs_pos,
+            screen_normals=Intensifiers.bs_normal_vec,
+            screen_verticals=Intensifiers.bs_vertical_vec,
+            screen_sizes_h=1600 * cal_pixel_size,
+            screen_sizes_v=1600 * cal_pixel_size,
+            principal_points_h=cal_principal_point_h_bs,
+            principal_points_v=cal_principal_point_v_bs,
+            focal_lengths=cal_focal_length_bs,
         )
 
+        camera_2 = Camera(
+            "camera_2",
+            screen_center_poses=Intensifiers.fs_pos,
+            screen_normals=Intensifiers.fs_normal_vec,
+            screen_verticals=Intensifiers.fs_vertical_vec,
+            screen_sizes_h=1600 * cal_pixel_size,
+            screen_sizes_v=1600 * cal_pixel_size,
+            principal_points_h=cal_principal_point_h_fs,
+            principal_points_v=cal_principal_point_v_fs,
+            focal_lengths=cal_focal_length_fs,
+        )
         their_world_to_yours = torch.tensor(
             [
-                [1, 0, 0, cal_principal_point_h],
-                [0, 1, 0, cal_principal_point_v],
-                [0, 0, 1, cal_focal_length],
+                [1, 0, 0, cal_principal_point_h_bs],
+                [0, 1, 0, cal_principal_point_v_bs],
+                [0, 0, 1, cal_focal_length_bs],
                 [0, 0, 0, 1],
             ],
             dtype=torch.float32,
@@ -86,12 +160,13 @@ class PoseEstimationFineTuneModel(pl.LightningModule):
 
         scene_sipla = Scene()
         scene_sipla.add_anatomies(self.anatomy_ct)
-        scene_sipla.add_cameras(cam)
+        scene_sipla.add_cameras(camera_1)
+        scene_sipla.add_cameras(camera_2)
 
         renderer = CTRenderer(device="cuda")
         renderer.bind_scene(scene_sipla)
 
-        return renderer, cam, their_world_to_yours
+        return renderer, their_world_to_yours
 
     def compute_loss(self, images, decoded_image):
         """
@@ -153,102 +228,239 @@ class PoseEstimationFineTuneModel(pl.LightningModule):
         tmat = tmat.unsqueeze(0)
         return tmat
 
+    def tmat_to_pose(self, tmat):
+        """
+        将 4x4 变换矩阵转换为 9D pose。
+        """
+        rotation_matrix = tmat[:, :3, :3]
+        translation = tmat[:, :3, 3]
+
+        # 将 rotation_matrix 转为 6D 表示
+        rotation_6d = matrix_to_rotation_6d(rotation_matrix)
+        # breakpoint()
+        # 拼接 translation 和 rotation_6d
+        pose_9d = torch.cat([translation.squeeze(), rotation_6d.squeeze()], dim=0)
+
+        return pose_9d
+
     def training_step(self, batch, batch_idx):
         images, target_pose = batch['image'], batch['pose']
-        pred_pose, decoded_image = self(images)
+        batch_size = images.size(0)
+        current_epoch = self.current_epoch
+        total_epochs = self.trainer.max_epochs
+        # 初始化存储
+        inputs = []
+        updated_target_pose = []
+        # 0.5 概率选择 rendered image
 
-        # 分割 9D 表示为平移和旋转
+        use_rendered = torch.rand(1).item() <= self.use_render_p
+        if use_rendered:
+            for i in range(batch_size):
+                # 将 target_pose 转换为 4x4 变换矩阵
+                tmat = self.pose_to_tmat(target_pose[i])
+
+                # 添加噪声到 tmat
+                noised_tmat = self.add_noise_to_tmat(tmat.clone())
+
+                # 将噪声后的 tmat 渲染为虚拟 X-ray 图像
+                rendered_image_bs, rendered_image_fs = self.generate_virtual_xray_with_grad(
+                    tmat=noised_tmat,
+                    img_resolution_width=images[i].shape[-1],
+                    img_resolution_height=images[i].shape[-1],
+                    binary=False
+                )
+                rendered_image_bs = 1 - rendered_image_bs[0]
+                rendered_image_fs = 1 - rendered_image_fs[0]
+                # breakpoint()
+                # 拼接 rendered images
+                rendered_image = torch.stack(
+                    [rendered_image_bs, rendered_image_fs, torch.zeros_like(rendered_image_bs)], dim=0)
+
+                # 将 noised_tmat 转回 9D pose
+                noised_pose = self.tmat_to_pose(noised_tmat)
+
+                # 更新输入和目标 pose
+                inputs.append(rendered_image)
+                updated_target_pose.append(noised_pose)
+
+            # 合并 batch
+            inputs = torch.stack(inputs, dim=0)
+            updated_target_pose = torch.stack(updated_target_pose, dim=0)
+        else:
+            # 使用原始图像和 pose
+            inputs = images.clone()  # 确保类型一致
+            updated_target_pose = target_pose.clone()
+
+        # 通过网络进行预测
+        pred_pose = self(inputs)
+
+        # 分离平移和旋转部分
         pred_translation, pred_rotation = pred_pose[:, :3], pred_pose[:, 3:]
-        target_translation, target_rotation = target_pose[:, :3], target_pose[:, 3:]
+        target_translation, target_rotation = updated_target_pose[:, :3], updated_target_pose[:, 3:]
 
         # 计算损失
         loss_translation = self.translation_loss(pred_translation, target_translation)
         loss_rotation = self.rotation_loss(pred_rotation, target_rotation)
-        loss_structural = self.compute_loss(images, decoded_image)  # Structural-Aware Loss
+        # loss_structural = self.compute_loss(images, decoded_image)  # Structural-Aware Loss
+        if self.use_render_loss:
+            gcc_loss_value = 0
+            # add NCC loss
+            for i in range(len(pred_pose)):
+                pred_tmat = self.pose_to_tmat(pred_pose[i])
 
-        gcc_loss_value = 0
-        # add NCC loss
-        for i in range(len(pred_pose)):
-            pred_tmat = self.pose_to_tmat(pred_pose[i])
+                # 生成虚拟X-ray图像
+                rendered_image_bs, rendered_image_fs = self.generate_virtual_xray_with_grad(
+                    tmat=pred_tmat,
+                    img_resolution_width=images[i].shape[-1],
+                    img_resolution_height=images[i].shape[-1], binary=False)
+                rendered_image_bs = 1 - rendered_image_bs
+                rendered_image_fs = 1 - rendered_image_fs
 
-            # 生成虚拟X-ray图像
-            rendered_image = 1 - self.generate_virtual_xray_with_grad(
-                tmat=pred_tmat,
-                img_resolution_width=images[i].shape[-1],
-                img_resolution_height=images[i].shape[-1], binary=False)
+                # 将原始图像与生成图像进行NCC计算
+                background_image_tensor = images[i].clone().detach().unsqueeze(dim=0).to(dtype=torch.float32)
 
-            # 将原始图像与生成图像进行NCC计算
-            background_image_tensor = images[i].clone().detach().unsqueeze(dim=0).to(dtype=torch.float32)
+                # gcc_loss_value += gcc_loss(rendered_image_bs, background_image_tensor[:, 0, :, :]) + gcc_loss(
+                #     rendered_image_fs,
+                #     background_image_tensor[
+                #     :, 1, :, :])
+                gcc_loss_value += ncc_loss(rendered_image_bs, background_image_tensor[:, 0, :, :]) + ncc_loss(
+                    rendered_image_fs,
+                    background_image_tensor[
+                    :, 1, :, :])
+                # 对所有样本的NCC损失求平均
+            gcc_loss_value = gcc_loss_value / len(pred_pose)
 
-            gcc_loss_value += gcc_loss(rendered_image, background_image_tensor[:, 0, :, :])
-
-            # 对所有样本的NCC损失求平均
-        gcc_loss_value = gcc_loss_value / len(pred_pose)
-
-        loss = loss_translation + loss_rotation + gcc_loss_value
+            loss = loss_translation + loss_rotation + gcc_loss_value
+        else:
+            loss = loss_translation + loss_rotation
         # 记录损失
         self.log('train_loss', loss)
         self.log('train_translation_loss', loss_translation)
         self.log('train_rotation_loss', loss_rotation)
-        self.log('train_structural_loss', loss_structural)
+        if self.use_render_loss:
+            self.log('train_rendered_loss', gcc_loss_value)
         return loss
 
     def validation_step(self, batch, batch_idx):
         images, target_pose = batch['image'], batch['pose']
-        pred_pose, decoded_image = self(images)
+        batch_size = images.size(0)
+        current_epoch = self.current_epoch
+        total_epochs = self.trainer.max_epochs
+        # 初始化存储
+        inputs = []
+        updated_target_pose = []
+        if self.use_render_p > 0.99:
+            for i in range(batch_size):
+                # 将 target_pose 转换为 4x4 变换矩阵
+                tmat = self.pose_to_tmat(target_pose[i])
 
+                # 添加噪声到 tmat
+                noised_tmat = self.add_noise_to_tmat(tmat.clone())
+
+                # 将噪声后的 tmat 渲染为虚拟 X-ray 图像
+                rendered_image_bs, rendered_image_fs = self.generate_virtual_xray_with_grad(
+                    tmat=noised_tmat,
+                    img_resolution_width=images[i].shape[-1],
+                    img_resolution_height=images[i].shape[-1],
+                    binary=False
+                )
+                rendered_image_bs = 1 - rendered_image_bs[0]
+                rendered_image_fs = 1 - rendered_image_fs[0]
+                # breakpoint()
+                # 拼接 rendered images
+                rendered_image = torch.stack(
+                    [rendered_image_bs, rendered_image_fs, torch.zeros_like(rendered_image_bs)], dim=0)
+
+                # 将 noised_tmat 转回 9D pose
+                noised_pose = self.tmat_to_pose(noised_tmat)
+
+                # 更新输入和目标 pose
+                inputs.append(rendered_image)
+                updated_target_pose.append(noised_pose)
+
+            # 合并 batch
+            inputs = torch.stack(inputs, dim=0)
+            updated_target_pose = torch.stack(updated_target_pose, dim=0)
+        else:
+            # 使用原始图像和 pose
+            inputs = images.clone()  # 确保类型一致
+            updated_target_pose = target_pose.clone()
+
+        # 通过网络进行预测
+        pred_pose = self(inputs)
+
+        # 分离平移和旋转部分
         pred_translation, pred_rotation = pred_pose[:, :3], pred_pose[:, 3:]
-        target_translation, target_rotation = target_pose[:, :3], target_pose[:, 3:]
+        target_translation, target_rotation = updated_target_pose[:, :3], updated_target_pose[:, 3:]
 
         loss_translation = self.translation_loss(pred_translation, target_translation)
         loss_rotation = self.rotation_loss(pred_rotation, target_rotation)
-        loss_structural = self.compute_loss(images, decoded_image)  # Structural-Aware Loss
+        # loss_structural = self.compute_loss(images, decoded_image)  # Structural-Aware Loss
         gcc_loss_value = 0
-        pred_synth = []
+        pred_synth_bs = []
+        pred_synth_fs = []
         for i in range(len(pred_pose)):
             pred_tmat = self.pose_to_tmat(pred_pose[i])
 
             # 生成虚拟X-ray图像
-            rendered_image = 1 - self.generate_virtual_xray_with_grad(
+            rendered_image_bs, rendered_image_fs = self.generate_virtual_xray_with_grad(
                 tmat=pred_tmat,
                 img_resolution_width=images[i].shape[-1],
                 img_resolution_height=images[i].shape[-1], binary=False)
+            rendered_image_bs = 1 - rendered_image_bs
+            rendered_image_fs = 1 - rendered_image_fs
 
             # 将原始图像与生成图像进行NCC计算
             background_image_tensor = images[i].clone().detach().unsqueeze(dim=0).to(dtype=torch.float32)
 
-            gcc_loss_value += gcc_loss(rendered_image, background_image_tensor[:, 0, :, :])
-            pred_synth.append(torch.tensor(rendered_image).unsqueeze(0))  # (1, 1, H, W)
+            # gcc_loss_value += gcc_loss(rendered_image_bs, background_image_tensor[:, 0, :, :]) + gcc_loss(
+            #     rendered_image_fs,
+            #     background_image_tensor[
+            #     :, 1, :, :])
+            gcc_loss_value += ncc_loss(rendered_image_bs, background_image_tensor[:, 0, :, :]) + ncc_loss(
+                rendered_image_fs,
+                background_image_tensor[
+                :, 1, :, :])
+            pred_synth_bs.append(torch.tensor(rendered_image_bs).unsqueeze(0))  # (1, 1, H, W)
+            pred_synth_fs.append(torch.tensor(rendered_image_fs).unsqueeze(0))  # (1, 1, H, W)
             # 对所有样本的NCC损失求平均
-        pred_synth = torch.cat(pred_synth, dim=0)  # (B, 1, H, W)
+        pred_synth_bs = torch.cat(pred_synth_bs, dim=0)  # (B, 1, H, W)
+        pred_synth_fs = torch.cat(pred_synth_fs, dim=0)  # (B, 1, H, W)
         gcc_loss_value = gcc_loss_value / len(pred_pose)
-
-        val_loss = loss_translation + loss_rotation + gcc_loss_value
-
+        if self.use_render_loss:
+            val_loss = loss_translation + loss_rotation + gcc_loss_value
+        else:
+            val_loss = loss_translation + loss_rotation
         self.log('val_loss', val_loss, prog_bar=True)
-        self.log('val_translation_loss', loss_translation, prog_bar=True)
-        self.log('val_rotation_loss', loss_rotation, prog_bar=True)
-        self.log('val_structural_loss', loss_structural, prog_bar=True)
+        self.log('val_translation_loss', loss_translation, prog_bar=False)
+        self.log('val_rotation_loss', loss_rotation, prog_bar=False)
+        if self.use_render_loss:
+            self.log('val_rendered_loss', gcc_loss_value, prog_bar=False)
         # Log images (log only the first batch)
         if batch_idx == 0:
             # Make grids
-            batch_size = images.shape[0]
+            batch_size = inputs.shape[0]
             indices = torch.randperm(batch_size)[:4] if batch_size > 8 else torch.arange(batch_size)
-            input_images = images[indices, 0:1, :, :]
-            decoded_images = decoded_image[indices, 0:1, :, :]
+            input_images_bs = inputs[indices, 0:1, :, :]
+            input_images_fs = inputs[indices, 1:2, :, :]
+            # decoded_images = decoded_image[indices, 0:1, :, :]
             # breakpoint()
-            input_images_grid = make_grid(input_images, nrow=2, normalize=True, value_range=(0, 1))
-            decoded_images_grid = make_grid(decoded_images, nrow=2, normalize=True, value_range=(0, 1))
+            input_images_grid_bs = make_grid(input_images_bs, nrow=2, normalize=True, value_range=(0, 1))
+            input_images_grid_fs = make_grid(input_images_fs, nrow=2, normalize=True, value_range=(0, 1))
+            # decoded_images_grid = make_grid(decoded_images, nrow=2, normalize=True, value_range=(0, 1))
 
-            pred_images_grid = make_grid(pred_synth, nrow=2, normalize=True, value_range=(0, 1))
-
+            pred_images_grid_bs = make_grid(pred_synth_bs, nrow=2, normalize=True, value_range=(0, 1))
+            pred_images_grid_fs = make_grid(pred_synth_fs, nrow=2, normalize=True, value_range=(0, 1))
             # Add images to TensorBoard
-            self.logger.experiment.add_image('val_input_images', input_images_grid, self.current_epoch,
+            self.logger.experiment.add_image('val_input_images_bs', input_images_grid_bs, self.current_epoch,
                                              dataformats="CHW")
-            self.logger.experiment.add_image('val_decoded_images', decoded_images_grid, self.current_epoch,
+            self.logger.experiment.add_image('val_input_images_fs', input_images_grid_fs, self.current_epoch,
                                              dataformats="CHW")
-            self.logger.experiment.add_image('val_pred_images', pred_images_grid, self.current_epoch, dataformats="CHW")
 
+            self.logger.experiment.add_image('val_pred_images_bs', pred_images_grid_bs, self.current_epoch,
+                                             dataformats="CHW")
+            self.logger.experiment.add_image('val_pred_images_fs', pred_images_grid_fs, self.current_epoch,
+                                             dataformats="CHW")
         return val_loss
 
     def configure_optimizers(self):
@@ -259,15 +471,19 @@ class PoseEstimationFineTuneModel(pl.LightningModule):
         self.set_model_matrix(self.anatomy_ct, tmat, self.their_world_to_yours)
         # breakpoint()
         try:
-            foreground_efficient_renderer = self.renderer.render_efficient_memory(
+            foreground_efficient_renderer_1 = self.renderer.render_efficient_memory(
                 0, img_resolution_width, img_resolution_height, binary=binary
             )[:, :, :]
-            foreground_efficient_renderer.requires_grad_(True)
+            foreground_efficient_renderer_1.requires_grad_(True)
+            foreground_efficient_renderer_2 = self.renderer.render_efficient_memory(
+                1, img_resolution_width, img_resolution_height, binary=binary
+            )[:, :, :]
+            foreground_efficient_renderer_2.requires_grad_(True)
         except torch._C._LinAlgError as e:
             print(f"Matrix inversion failed: {e}")
             print(f"Camera transformation matrix: {self.cam.tmats}")
             breakpoint()
-        return foreground_efficient_renderer
+        return foreground_efficient_renderer_1, foreground_efficient_renderer_2
 
     def set_model_matrix(self, ct_data, tmat, their_world_to_yours):
         rotation_about_z = torch.tensor(
@@ -276,148 +492,3 @@ class PoseEstimationFineTuneModel(pl.LightningModule):
         )[None].to(tmat.device)
         ct_data.set_model_matrix(torch.matmul(tmat, rotation_about_z), is_yours=True,
                                  theirs_to_yours=their_world_to_yours)
-
-
-import torch
-import torch.nn as nn
-import pytorch_lightning as pl
-from torchvision.models.segmentation import deeplabv3_resnet50
-from torchvision.transforms.functional import gaussian_blur
-from pytorch_msssim import SSIM
-from losses import gcc_loss
-import torch.nn.functional as F
-
-
-class EncoderDecoderSelfSupervised(pl.LightningModule):
-    def __init__(self, learning_rate=1e-3, loss_type="gcc", noise_std=0.0):
-        """
-        使用完整的 DeepLabv3 模型作为 AutoEncoder。
-        Args:
-            learning_rate (float): 学习率。
-            loss_type (str): 损失函数类型 ("gcc", "mse", "ssim")。
-            noise_std (float): 添加到输入图像的高斯噪声标准差。
-        """
-        super(EncoderDecoderSelfSupervised, self).__init__()
-        self.learning_rate = learning_rate
-        self.loss_type = loss_type
-        self.noise_std = noise_std
-
-        # 加载预训练的 DeepLabv3 模型
-        self.deeplab = deeplabv3_resnet50(weights="DEFAULT")
-
-        # 修改 classifier 的最后一层以适应 AutoEncoder 的输出
-        self.deeplab.classifier[4] = nn.Conv2d(256, 3, kernel_size=1)
-        self.deeplab.aux_classifier = None  # 移除辅助分类器
-        self.sigmoid = nn.Sigmoid()  # 将输出限制在 [0, 1]
-
-        # 损失函数
-        self.mse_loss = nn.MSELoss()
-        self.ssim_loss = SSIM(data_range=1.0, size_average=True, channel=3)
-
-    def add_noise(self, images):
-        """
-        添加高斯噪声到输入图像。
-        Args:
-            images (torch.Tensor): 输入图像，形状为 [B, C, H, W]。
-        Returns:
-            torch.Tensor: 加入噪声的图像。
-        """
-        noise = torch.randn_like(images) * self.noise_std
-        return images + noise
-
-    def forward(self, x):
-        """
-        前向传播，直接使用 DeepLabv3 的结构。
-        Args:
-            x (torch.Tensor): 输入图像 [B, C, H, W]。
-        Returns:
-            torch.Tensor: 解码后的图像 [B, C, H, W]。
-        """
-        output = self.deeplab(x)["out"]  # DeepLabv3 的输出
-        if output.size(-1) == 1 and output.size(-2) == 1:
-            output = F.adaptive_avg_pool2d(output, (1, 1))  # 全局平均池化
-        return self.sigmoid(output)  # 限制输出范围在 [0, 1]
-
-    def compute_loss(self, images, decoded_image):
-        """
-        根据 loss_type 计算损失。
-        Args:
-            images (torch.Tensor): Ground truth 图像 [B, C, H, W]。
-            decoded_image (torch.Tensor): 解码图像 [B, C, H, W]。
-        Returns:
-            torch.Tensor: 总损失。
-        """
-        if self.loss_type == "gcc":
-            total_loss_gcc = 0.0
-            for i in range(images.size(0)):
-                loss = gcc_loss(images[i, 0:1, :, :], decoded_image[i, 0:1, :, :]) + gcc_loss(images[i, 1:2, :, :],
-                                                                                              decoded_image[i, 1:2, :,
-                                                                                              :])
-                total_loss_gcc += loss
-            total_loss_gcc /= images.size(0)
-            total_loss = total_loss_gcc
-        elif self.loss_type == "mse":
-            total_loss = self.mse_loss(decoded_image, images)
-        elif self.loss_type == "ssim":
-            total_loss = 1 - self.ssim_loss(decoded_image, images)  # 最大化结构相似性
-        elif self.loss_type == "combine":
-            total_loss_mse = self.mse_loss(decoded_image, images)
-            total_loss_gcc = 0.0
-            for i in range(images.size(0)):
-                # breakpoint()
-                loss = gcc_loss(images[i, 0:1, :, :], decoded_image[i, 0:1, :, :]) + gcc_loss(images[i, 1:2, :, :],
-                                                                                              decoded_image[i, 1:2, :,
-                                                                                              :])
-                total_loss_gcc += loss
-            total_loss_gcc /= images.size(0)
-            total_loss = total_loss_gcc + total_loss_mse
-        else:
-            raise ValueError(f"Unsupported loss type: {self.loss_type}")
-
-        return total_loss
-
-    def training_step(self, batch, batch_idx):
-        images = batch['image']  # Ground truth 图像 [B, C, H, W]
-        noisy_images = self.add_noise(images)  # 添加噪声
-        decoded_image = self(noisy_images)  # 解码噪声图像
-        total_loss = self.compute_loss(images, decoded_image)  # 计算损失
-        self.log('train_loss', total_loss)
-        return total_loss
-
-    def validation_step(self, batch, batch_idx):
-        images = batch['image']  # Ground truth 图像 [B, C, H, W]
-        noisy_images = self.add_noise(images)  # 添加噪声
-        decoded_image = self(noisy_images)  # 解码噪声图像
-        total_loss = self.compute_loss(images, decoded_image)  # 计算损失
-
-        if batch_idx == 0:
-            self.log_images(noisy_images[0], decoded_image[0])
-
-        self.log('val_loss', total_loss, prog_bar=True)
-        return total_loss
-
-    def log_images(self, input_image, output_image):
-        """
-        在 TensorBoard 中记录输入和输出图像。
-        Args:
-            input_image (torch.Tensor): 输入图像 [C, H, W]。
-            output_image (torch.Tensor): 输出图像 [C, H, W]。
-        """
-        input_image_np = input_image.permute(1, 2, 0).detach().cpu().numpy()
-        output_image_np = output_image.permute(1, 2, 0).detach().cpu().numpy()
-
-        self.logger.experiment.add_image(
-            "Input Image bs", input_image_np[:, :, 0:1], self.current_epoch, dataformats="HWC"
-        )
-        self.logger.experiment.add_image(
-            "Decoded Image bs", output_image_np[:, :, 0:1], self.current_epoch, dataformats="HWC"
-        )
-        self.logger.experiment.add_image(
-            "Input Image fs", input_image_np[:, :, 1:2], self.current_epoch, dataformats="HWC"
-        )
-        self.logger.experiment.add_image(
-            "Decoded Image fs", output_image_np[:, :, 1:2], self.current_epoch, dataformats="HWC"
-        )
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)

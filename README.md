@@ -1,6 +1,8 @@
 
-![image.imageformat.376.1260193512.png](lmb_logo.png)
-# Veriserum (Ongoing)
+<p align="left">
+  <img src="lmb_logo.png" alt="LMB Logo" width="360"/>
+</p>
+# Veriserum (determined to be published on MICCAI 2025)
 
 **Veriserum**: A dual-plane fluoroscopic dataset with implant phantoms for deep learning in medical imaging.
 
@@ -14,8 +16,15 @@ Switzerland
 
 NB: The relevant paper is not yet published. If you are interested please contact first author. After open publication, you may cite the paper and free to use the dataset.
 
-## Original data to download:
+<div style="display: flex; gap: 10px;">
+  <img src="image-1.png" width="49%"/>
+  <img src="image-2.png" width="49%"/>
+</div>
 
+
+
+## Original data to download:
+![alt text](image.png)
 https://doi.org/10.3929/ethz-b-000701146
 - original images
 - sqlite3 database for all poses: veriserum original target pose (from patients' data), refined true pose (by automated registration), and 390 manually matched pose.

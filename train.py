@@ -4,7 +4,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, random_split
-from model import PoseEstimationFineTuneModel, EncoderDecoderSelfSupervised  # 导入模型
+from model import PoseEstimationFineTuneModel  # 导入模型
 from veriserum_dataset import Veriserum_calibrated  # 假设数据集在 veriserum_dataset.py 文件中
 from sampler import NonObsoleteSampler  # 假设采样器在 sampler.py 文件中
 import torchvision.transforms as transforms
@@ -56,27 +56,40 @@ def main(loss_type='combine'):
         num_workers=1,
         drop_last=True
     )
-    # 创建模型
+    render_p = 0.
+    # ckpt_path=False
+    ckpt_path = rf'C:\Users\Public\Public Dupla\veriserum\checkpoints_actual\estimationepoch=194-val_loss=7.9368.ckpt'
+    # 如果指定了检查点路径，则加载模型和检查点
+    if ckpt_path:
+        model = PoseEstimationFineTuneModel.load_from_checkpoint(ckpt_path,
+                                                                 anatomy_path=rf'D:\veriserum_anatomies\ana_000001_HU10000_filled.nii',
+                                                                 freeze=0.3)
+        print(f"Loaded model from checkpoint: {ckpt_path}")
+        # 动态调整 `use_render_p`
+        model.use_render_p = render_p
+        model.translation_range = 1  # 平移噪声范围 (单位: mm)
+        model.rotation_range = 1  # 旋转噪声范围 (单位: 度)
+        model.use_render_loss = False
+        print(f"Updated use_render_p to {model.use_render_p}")
+    else:
+        # 初始化新模型
+        # breakpoint()
+        model = PoseEstimationFineTuneModel(
+            learning_rate=1e-3,
+            loss_type=loss_type,
+            anatomy_path=rf'D:\veriserum_anatomies\ana_000001_HU10000_filled.nii'
+        )  # 加载预训练的 Encoder 和 Decoder 权重
 
-    # pretrain_model = EncoderDecoderSelfSupervised(learning_rate=1e-3, loss_type=loss_type)
-
-    # 初始化新模型
-    pretrained_path = rf'C:\Users\Public\Public Dupla\veriserum\checkpoints_pretrained\pretrain_gcc_epoch=199-val_loss=0.3543.ckpt'
-
-    model = PoseEstimationFineTuneModel(autoencoder_checkpoint=pretrained_path, learning_rate=1e-3, loss_type='mse',
-                                           anatomy_path=rf'D:\veriserum_anatomies\ana_000001_HU10000_filled.nii')
-    # 加载预训练的 Encoder 和 Decoder 权重
-
-    # 定义模型保存的回调
-    logger_pretrain = TensorBoardLogger("pretrain_logs", name=f"pretrain_{loss_type}_loss")
-    checkpoint_callback_pretrain = ModelCheckpoint(
-        monitor='val_loss',
-        dirpath=f'checkpoints_pretrained',
-        filename=f'pretrain_{loss_type}_' + '{epoch:02d}-{val_loss:.4f}',
-        save_top_k=1,
-        mode='min'
-    )
-    logger_actual = TensorBoardLogger("estimation_logs2")
+    # # 定义模型保存的回调
+    # logger_pretrain = TensorBoardLogger("pretrain_logs", name=f"pretrain_{loss_type}_loss")
+    # checkpoint_callback_pretrain = ModelCheckpoint(
+    #     monitor='val_loss',
+    #     dirpath=f'checkpoints_pretrained',
+    #     filename=f'pretrain_{loss_type}_' + '{epoch:02d}-{val_loss:.4f}',
+    #     save_top_k=1,
+    #     mode='min'
+    # )
+    logger_actual = TensorBoardLogger("estimation_logs")
     checkpoint_callback_actual = ModelCheckpoint(
         monitor='val_loss',
         dirpath=f'checkpoints_actual',
@@ -86,7 +99,7 @@ def main(loss_type='combine'):
     )
     # 使用 PyTorch Lightning 的 Trainer 进行训练
     trainer = pl.Trainer(
-        max_epochs=250,
+        max_epochs=200,
         logger=logger_actual,
         callbacks=[checkpoint_callback_actual],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",

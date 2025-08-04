@@ -180,63 +180,30 @@ def gcc_loss(image_curr_bs: torch.Tensor, target_image_curr_bs: torch.Tensor, ma
 
 import torch
 
-def ncc(x, y, return_map=False, reduction='mean', eps=1e-8):
-    assert x.requires_grad or y.requires_grad, "At least one input must require gradients."
-    """
-    计算 N 维的标准化互相关 (NCC)。
-
-    Args:
-        x (torch.Tensor): 输入张量1 (BHW)。
-        y (torch.Tensor): 输入张量2 (BHW)。
-        return_map (bool): 是否返回 NCC map。
-        reduction (str): 指定输出的操作 ('mean' 或 'sum')。
-        eps (float): 防止数值不稳定的 epsilon 值。
-
-    Returns:
-        torch.Tensor: NCC 相似度值。
-        torch.Tensor: NCC map (如果 return_map 为 True)。
-    """
-    # breakpoint()
-    # 获取形状信息
-    shape = x.shape
-    b = shape[0]
-
-    # 重塑为 (B, N)
-    x = x.view(b, -1)
-    y = y.view(b, -1)
-
-    # 计算均值
-    x_mean = torch.mean(x, dim=1, keepdim=True)
-    y_mean = torch.mean(y, dim=1, keepdim=True)
-
-    # 去除均值
-    x = x - x_mean
-    y = y - y_mean
-
-    # 逐元素相乘和平方操作
-    dev_xy = torch.mul(x, y)
-    dev_xx = torch.mul(x, x)
-    dev_yy = torch.mul(y, y)
-
-    # 分别计算 dev_xx 和 dev_yy 的和
-    dev_xx_sum = torch.sum(dev_xx, dim=1, keepdim=True)
-    dev_yy_sum = torch.sum(dev_yy, dim=1, keepdim=True)
-
-    # 计算 NCC
-    ncc = torch.div(dev_xy + eps / dev_xy.shape[1],
-                    torch.sqrt(torch.mul(dev_xx_sum, dev_yy_sum)) + eps)
-    ncc_map = ncc.view(b, *shape[1:])
-    # print(f"NCC requires_grad: {ncc.requires_grad}, grad_fn: {ncc.grad_fn}")
-    # 根据 reduction 参数进行归约
-    if reduction == 'mean':
-        ncc = 1 - torch.mean(torch.sum(ncc, dim=1))
-    elif reduction == 'sum':
-        ncc = torch.sum(ncc)
+def ncc_loss(image_curr_bs: Tensor, target_image_curr_bs: Tensor,mask=None,dilation_kernel_size=5) -> Tensor:
+    if mask is None:
+        # Normalized Cross-Correlation Loss implementation
+        loss_function = NormalizedCrossCorrelation()  # Assuming NCC is implemented elsewhere
+        return 1.0 - loss_function(image_curr_bs, target_image_curr_bs)
     else:
-        raise KeyError(f"不支持的 reduction 类型: {reduction}")
+        # 有 mask 的标准化互相关损失实现
+        loss_function = NormalizedCrossCorrelation(return_map=True)  # 假设 NCC 已经在其他地方实现
+        ncc, ncc_map = loss_function(image_curr_bs, target_image_curr_bs)
 
-    # 返回结果
-    if not return_map:
-        return ncc
+        # 如果 mask 和 ncc_map 大小不匹配，调整 mask 尺寸
+        if mask.shape[-2:] != ncc_map.shape[-2:]:
+            mask = F.interpolate(mask.unsqueeze(1), size=ncc_map.shape[-2:]).squeeze(1)
 
-    return ncc, ncc_map
+        # Define dilation kernel
+        dilation_kernel = torch.ones(1, 1, dilation_kernel_size, dilation_kernel_size, device=mask.device)
+
+        # Dilate the mask using 2D convolution
+        mask = F.conv2d(mask.unsqueeze(0), dilation_kernel, padding=dilation_kernel_size // 2).squeeze(0)
+
+        # Binarize the mask (e.g., set threshold at 0.5, or adjust based on your needs)
+        mask = torch.where(mask > 0.5, torch.tensor(1.0, device=mask.device), torch.tensor(0.0, device=mask.device))
+
+        # 使用 mask 来计算加权的 NCC 损失
+        ncc_weighted = (ncc_map * mask).sum()
+        # breakpoint()
+        return 1 - ncc_weighted
