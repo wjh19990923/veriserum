@@ -25,6 +25,7 @@ NB: The relevant paper is not yet published. If you are interested please contac
 
 ## Original data to download:
 ![alt text](image.png)
+
 https://doi.org/10.3929/ethz-b-000701146
 - original images
 - sqlite3 database for all poses: veriserum original target pose (from patients' data), refined true pose (by automated registration), and 390 manually matched pose.
